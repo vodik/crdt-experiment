@@ -1,0 +1,10 @@
+[package]
+name = "rga"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1.6.0"
+test-strategy = "0.4.0"
