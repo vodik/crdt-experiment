@@ -43,10 +43,10 @@ impl PartialOrd for Clock {
         for (&site, &self_counter) in self.clock.iter().chain(other.clock.iter()) {
             let other_counter = other.clock.get(&site).cloned().unwrap_or(0);
 
-            if self_counter < other_counter {
-                less = true;
-            } else if self_counter > other_counter {
-                greater = true;
+            match self_counter.cmp(&other_counter) {
+                Ordering::Less => less = true,
+                Ordering::Greater => greater = true,
+                Ordering::Equal => {}
             }
         }
 
@@ -56,11 +56,5 @@ impl PartialOrd for Clock {
             (false, true) => Some(Ordering::Greater),
             (false, false) => Some(Ordering::Equal),
         }
-    }
-}
-
-impl Ord for Clock {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
     }
 }

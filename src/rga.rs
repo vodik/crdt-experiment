@@ -1,16 +1,14 @@
-use crate::clock::Clock;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Id {
-    pub site: u64,
-    pub seq: u64,
+    site: u64,
+    seq: u64,
 }
 
 impl Id {
-    pub fn new(site: u64, clock: &Clock) -> Self {
-        let seq = clock.sum();
+    pub fn new(site: u64, seq: u64) -> Self {
         Self { site, seq }
     }
 }
@@ -30,50 +28,35 @@ impl Ord for Id {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Operation<T> {
-    clock: Clock,
-    op: Op<T>,
-}
-
-impl<T> Operation<T> {
-    pub fn insert(clock: Clock, insert_id: Id, left_id: Option<Id>, value: T) -> Self {
-        Self {
-            clock,
-            op: Op::Insert(InsertOp {
-                insert_id,
-                left_id,
-                value,
-            }),
-        }
-    }
-
-    pub fn update(clock: Clock, insert_id: Id, new_version_id: Id, new_value: T) -> Self {
-        Self {
-            clock,
-            op: Op::Update(UpdateOp {
-                insert_id,
-                new_version_id,
-                new_value,
-            }),
-        }
-    }
-
-    pub fn delete(clock: Clock, insert_id: Id, new_version_id: Id) -> Self {
-        Self {
-            clock,
-            op: Op::Delete(DeleteOp {
-                insert_id,
-                new_version_id,
-            }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Op<T> {
+pub enum Operation<T> {
     Insert(InsertOp<T>),
     Update(UpdateOp<T>),
     Delete(DeleteOp),
+}
+
+impl<T> Operation<T> {
+    pub fn insert(insert_id: Id, left_id: Option<Id>, value: T) -> Self {
+        Self::Insert(InsertOp {
+            insert_id,
+            left_id,
+            value,
+        })
+    }
+
+    pub fn update(insert_id: Id, new_version_id: Id, new_value: T) -> Self {
+        Self::Update(UpdateOp {
+            insert_id,
+            new_version_id,
+            new_value,
+        })
+    }
+
+    pub fn delete(insert_id: Id, new_version_id: Id) -> Self {
+        Self::Delete(DeleteOp {
+            insert_id,
+            new_version_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,10 +90,9 @@ struct Entry<T> {
 
 impl<T> Entry<T> {
     fn new(insert_id: Id, value: T) -> Self {
-        let version_id = insert_id.clone();
         Self {
             insert_id,
-            version_id,
+            version_id: insert_id,
             next: None,
             value: Some(value),
         }
@@ -124,7 +106,7 @@ impl<T> Entry<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rga<T> {
     site: u64,
-    clock: Clock,
+    seq: u64,
     head: Option<Id>,
     map: HashMap<Id, Entry<T>>,
 }
@@ -134,18 +116,17 @@ where
     T: Clone,
 {
     pub fn new(site: u64) -> Self {
-        let clock = Clock::new();
         Self {
             site,
-            clock,
+            seq: 0,
             head: None,
             map: HashMap::new(),
         }
     }
 
     fn next_id(&mut self) -> Id {
-        self.clock.increment(self.site);
-        Id::new(self.site, &self.clock)
+        self.seq += 1;
+        Id::new(self.site, self.seq)
     }
 
     pub fn insert(&mut self, index: usize, value: T) -> Operation<T> {
@@ -155,7 +136,7 @@ where
 
         let insert_id = self.next_id();
         self.insert_left_of(left_id, insert_id, value.clone());
-        Operation::insert(self.clock.clone(), insert_id, left_id, value)
+        Operation::insert(insert_id, left_id, value)
     }
 
     pub fn push(&mut self, value: T) -> Operation<T> {
@@ -168,68 +149,76 @@ where
     where
         F: FnOnce(&mut T),
     {
-        let id = self.find_id_by_index(index)?;
-        let entry = self.map.get_mut(&id)?;
+        let insert_id = self.find_id_by_index(index)?;
+        let entry = self.map.get_mut(&insert_id)?;
         f(entry.value.as_mut()?);
 
         let new_version_id = self.next_id();
-        let entry = self.map.get_mut(&id).unwrap();
+        let entry = self.map.get_mut(&insert_id).unwrap();
         entry.version_id = new_version_id;
 
         Some(Operation::update(
-            self.clock.clone(),
-            id,
+            insert_id,
             new_version_id,
             entry.value.clone().unwrap(),
         ))
     }
 
     pub fn delete(&mut self, index: usize) -> Option<Operation<T>> {
-        let id = self.find_id_by_index(index)?;
-        let entry = self.map.get(&id)?;
+        let insert_id = self.find_id_by_index(index)?;
+        let entry = self.map.get(&insert_id)?;
         if entry.is_tombstone() {
             return None;
         }
 
         let new_version_id = self.next_id();
-        let entry = self.map.get_mut(&id)?;
+        let entry = self.map.get_mut(&insert_id)?;
         entry.value = None;
         entry.version_id = new_version_id;
 
-        Some(Operation::delete(self.clock.clone(), id, new_version_id))
+        Some(Operation::delete(insert_id, new_version_id))
     }
 
     pub fn apply(&mut self, op: Operation<T>) {
-        self.clock.merge(&op.clock);
-        match op.op {
-            Op::Insert(iop) => self.remote_insert(iop),
-            Op::Update(uop) => self.remote_update(uop),
-            Op::Delete(dop) => self.remote_delete(dop),
+        let updated = match op {
+            Operation::Insert(iop) => self.remote_insert(iop),
+            Operation::Update(uop) => self.remote_update(uop),
+            Operation::Delete(dop) => self.remote_delete(dop),
+        };
+
+        if updated {
+            self.seq += 1;
         }
     }
 
-    fn remote_insert(&mut self, iop: InsertOp<T>) {
+    fn remote_insert(&mut self, iop: InsertOp<T>) -> bool {
         if !self.map.contains_key(&iop.insert_id) {
             self.insert_left_of(iop.left_id, iop.insert_id, iop.value);
+            return true;
         }
+        false
     }
 
-    fn remote_update(&mut self, uop: UpdateOp<T>) {
+    fn remote_update(&mut self, uop: UpdateOp<T>) -> bool {
         if let Some(entry) = self.map.get_mut(&uop.insert_id) {
             if uop.new_version_id > entry.version_id {
                 entry.version_id = uop.new_version_id;
                 entry.value = Some(uop.new_value);
+                return true;
             }
         }
+        false
     }
 
-    fn remote_delete(&mut self, dop: DeleteOp) {
+    fn remote_delete(&mut self, dop: DeleteOp) -> bool {
         if let Some(entry) = self.map.get_mut(&dop.insert_id) {
             if dop.new_version_id > entry.version_id {
                 entry.version_id = dop.new_version_id;
                 entry.value = None;
+                return true;
             }
         }
+        false
     }
 
     fn insert_left_of(&mut self, left_id: Option<Id>, insert_id: Id, value: T) {
@@ -480,8 +469,8 @@ mod tests {
     ) {
         let base_rga = {
             let mut rga = Rga::new(0);
-            for value in &seed {
-                rga.push(*value);
+            for &value in &seed {
+                rga.push(value);
             }
             rga
         };
@@ -529,10 +518,6 @@ mod tests {
             // }
 
             for replica in replicas.iter_mut() {
-                if replica.site == replica_id as u64 + 1 {
-                    continue;
-                }
-
                 for operation in &broadcast_queue {
                     replica.apply(operation.clone());
                 }
@@ -540,13 +525,13 @@ mod tests {
         }
 
         // Check that each of the n replicas have a consistent view of the list.
-        let reference_vals: Vec<_> = replicas[0].iter().cloned().collect();
+        let reference_vals: Vec<_> = replicas[0].iter().collect();
         // eprintln!("\n--- {:?}", seed);
         // eprintln!("+++ {:?}", reference_vals);
         // eprintln!("===============");
 
         for replica in &replicas[1..] {
-            let vals: Vec<_> = replica.iter().cloned().collect();
+            let vals: Vec<_> = replica.iter().collect();
             prop_assert_eq!(&vals, &reference_vals);
         }
     }
