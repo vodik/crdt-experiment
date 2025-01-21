@@ -12,14 +12,14 @@ pub struct InsertOp<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateOp<T> {
     id: Id,
-    update_id: Id,
+    version_id: Id,
     new_value: T,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteOp {
     id: Id,
-    delete_id: Id,
+    version_id: Id,
 }
 
 impl<T> Op<T> {
@@ -27,16 +27,16 @@ impl<T> Op<T> {
         Self::Insert(InsertOp { id, left_id, value })
     }
 
-    fn update(id: Id, update_id: Id, new_value: T) -> Self {
+    fn update(id: Id, version_id: Id, new_value: T) -> Self {
         Self::Update(UpdateOp {
             id,
-            update_id,
+            version_id,
             new_value,
         })
     }
 
-    fn delete(id: Id, delete_id: Id) -> Self {
-        Self::Delete(DeleteOp { id, delete_id })
+    fn delete(id: Id, version_id: Id) -> Self {
+        Self::Delete(DeleteOp { id, version_id })
     }
 }
 
@@ -63,7 +63,7 @@ impl<T> Operation<T> {
 pub struct Entry<T> {
     pub id: Id,
     pub version_id: Id,
-    pub next: Option<Id>,
+    pub next_id: Option<Id>,
     // FIXME: Store tombstone as a flag so delete can be undone
     pub value: Option<T>,
 }
@@ -73,7 +73,7 @@ impl<T> Entry<T> {
         Self {
             id,
             version_id: id,
-            next: None,
+            next_id: None,
             value: Some(value),
         }
     }
@@ -142,12 +142,12 @@ where
         let entry = self.map.get_mut(&id)?;
         f(entry.value.as_mut()?);
 
-        let update_id = self.next_id();
+        let version_id = self.next_id();
         let entry = self.map.get_mut(&id).unwrap();
-        entry.version_id = update_id;
+        entry.version_id = version_id;
 
         Some(Operation::new(
-            Op::update(id, update_id, entry.value.clone().unwrap()),
+            Op::update(id, version_id, entry.value.clone().unwrap()),
             self.clock.delta_for(self.site),
         ))
     }
@@ -159,13 +159,13 @@ where
             return None;
         }
 
-        let delete_id = self.next_id();
+        let version_id = self.next_id();
         let entry = self.map.get_mut(&id)?;
         entry.value = None;
-        entry.version_id = delete_id;
+        entry.version_id = version_id;
 
         Some(Operation::new(
-            Op::delete(id, delete_id),
+            Op::delete(id, version_id),
             self.clock.delta_for(self.site),
         ))
     }
@@ -188,8 +188,8 @@ where
 
     fn remote_update(&mut self, uop: UpdateOp<T>) {
         if let Some(entry) = self.map.get_mut(&uop.id) {
-            if uop.update_id > entry.version_id {
-                entry.version_id = uop.update_id;
+            if uop.version_id > entry.version_id {
+                entry.version_id = uop.version_id;
                 entry.value = Some(uop.new_value);
             }
         }
@@ -197,8 +197,8 @@ where
 
     fn remote_delete(&mut self, dop: DeleteOp) {
         if let Some(entry) = self.map.get_mut(&dop.id) {
-            if dop.delete_id > entry.version_id {
-                entry.version_id = dop.delete_id;
+            if dop.version_id > entry.version_id {
+                entry.version_id = dop.version_id;
                 entry.value = None;
             }
         }
@@ -208,26 +208,25 @@ where
         let mut new_entry = Entry::new(id, value);
 
         match left_id {
-            None => self.head = Some(id),
+            None => new_entry.next_id = std::mem::replace(&mut self.head, Some(id)),
             Some(left_id) => {
-                let cur_entry = self.map.get_mut(&left_id).expect("broken pointer");
-                new_entry.next = std::mem::replace(&mut cur_entry.next, Some(id));
+                let entry = self.map.get_mut(&left_id).expect("broken pointer");
+                new_entry.next_id = std::mem::replace(&mut entry.next_id, Some(id));
             }
         }
 
         self.map.insert(id, new_entry);
     }
 
-    fn probe_forward(&self, current_id: Option<Id>, id: Id) -> Option<Id> {
-        let Some(mut cur) = current_id else {
-            return None;
-        };
-
+    fn probe_forward(&self, mut current_id: Option<Id>, id: Id) -> Option<Id> {
         loop {
-            let entry = self.map.get(&cur).expect("broken pointer");
-            match entry.next {
-                Some(next_id) if next_id > id => cur = next_id,
-                _ => break Some(cur),
+            let next_id = match current_id {
+                Some(current_id) => self.map.get(&current_id).expect("broken pointer").next_id,
+                None => self.head,
+            };
+            current_id = match next_id {
+                Some(next_id) if next_id > id => Some(next_id),
+                _ => break current_id,
             }
         }
     }
@@ -240,7 +239,7 @@ where
             let entry = self.map.get(&id).expect("broken pointer");
 
             latest_id = Some(id);
-            pos = entry.next;
+            pos = entry.next_id;
 
             if !entry.is_tombstone() {
                 if index == 0 {
@@ -272,7 +271,7 @@ impl<'a, T> Iterator for RgaIter<'a, T> {
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(id) = self.current {
             let entry = self.map.get(&id)?;
-            self.current = entry.next;
+            self.current = entry.next_id;
             if let Some(value) = &entry.value {
                 return Some(value);
             }
@@ -408,25 +407,33 @@ mod tests {
     fn test_concurrent_inserts() {
         let mut rga5 = Rga::new(5);
         let insert_a = rga5.insert(0, "A");
-        let insert_x = rga5.insert(1, "X");
 
         let mut rga1 = Rga::new(1);
-        rga1.apply(insert_a.clone());
-        let insert_y = rga1.insert(1, "Y");
+        let insert_b = rga1.insert(0, "B");
+
+        let mut rga2 = Rga::new(2);
+        let insert_c = rga2.insert(0, "C");
 
         let mut rga3 = Rga::new(3);
-        for op in [&insert_a, &insert_x, &insert_y] {
+        for op in [&insert_a, &insert_b, &insert_c] {
             rga3.apply(op.clone());
         }
         let vals: Vec<_> = rga3.iter().collect();
-        assert_eq!(vals, vec![&"A", &"X", &"Y"]);
+        assert_eq!(vals, vec![&"A", &"C", &"B"]);
 
         let mut rga3 = Rga::new(3);
-        for op in [insert_a, insert_y, insert_x] {
+        for op in [&insert_c, &insert_b, &insert_a] {
+            rga3.apply(op.clone());
+        }
+        let vals: Vec<_> = rga3.iter().collect();
+        assert_eq!(vals, vec![&"A", &"C", &"B"]);
+
+        let mut rga3 = Rga::new(3);
+        for op in [insert_c, insert_a, insert_b] {
             rga3.apply(op);
         }
         let vals: Vec<_> = rga3.iter().collect();
-        assert_eq!(vals, vec![&"A", &"X", &"Y"]);
+        assert_eq!(vals, vec![&"A", &"C", &"B"]);
     }
 
     #[derive(Debug)]
@@ -466,19 +473,31 @@ mod tests {
 
         // On each replica RGA, apply m operations.
         // Afterwards, broadcast all operations to every other replica.
+        eprintln!("===============");
         let mut broadcast_queue = vec![];
         for (replica_id, ops) in plan.iter().enumerate() {
             let replica: &mut Rga<u8> = &mut replicas[replica_id];
             broadcast_queue.clear();
 
+            eprintln!("modifying replica {}...", replica.site);
             for op in ops {
                 let operation = match op {
                     Op::Insert(index, value) => Some(replica.insert(*index, value.clone())),
                     Op::Replace(index, value) => replica.update(*index, |v| *v = value.clone()),
                     Op::Delete(index) => replica.delete(*index),
                 };
+
+                if let Some(operation) = &operation {
+                    eprintln!("-> {:<20} -> {:?}", format!("{:?}", op), operation);
+                } else {
+                    eprintln!("-> {:<20}", format!("{:?}", op));
+                }
+
                 broadcast_queue.extend(operation);
             }
+
+            eprintln!("broadcasting replica {} changes...", replica.site);
+            eprintln!("clock: {:?}", replica.clock);
 
             for replica in replicas.iter_mut() {
                 for operation in &broadcast_queue {
@@ -489,8 +508,12 @@ mod tests {
 
         // Check that each of the n replicas have a consistent view of the list.
         let reference_vals: Vec<_> = replicas[0].iter().collect();
+        eprintln!("seed {:?}", seed);
+        eprintln!("   0 {:?}", reference_vals);
+
         for replica in &replicas[1..] {
             let vals: Vec<_> = replica.iter().collect();
+            eprintln!("{:>4} {:?}", replica.site, vals);
             prop_assert_eq!(&vals, &reference_vals);
         }
     }

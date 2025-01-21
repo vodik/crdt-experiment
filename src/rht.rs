@@ -314,6 +314,7 @@ mod tests {
             }
             rht
         };
+        let baseline_vals: BTreeMap<_, _> = base_rht.iter().collect();
 
         // Create n replicas of the base RHT.
         let mut replicas: Vec<_> = plan
@@ -324,18 +325,30 @@ mod tests {
 
         // On each replica RHT, apply m operations.
         // Afterwards, broadcast all operations to every other replica.
+        eprintln!("===============");
         let mut broadcast_queue = vec![];
         for (replica_id, ops) in plan.iter().enumerate() {
             let replica: &mut Rht<usize, u8> = &mut replicas[replica_id];
             broadcast_queue.clear();
 
+            eprintln!("modifying replica {}...", replica.site);
             for op in ops {
                 let operation = match op {
                     Op::Put(key, value) => Some(replica.put(*key, value.clone())),
                     Op::Delete(key) => replica.delete(*key),
                 };
+
+                if let Some(operation) = &operation {
+                    eprintln!("-> {:<20} -> {:?}", format!("{:?}", op), operation);
+                } else {
+                    eprintln!("-> {:<20}", format!("{:?}", op));
+                }
+
                 broadcast_queue.extend(operation);
             }
+
+            eprintln!("broadcasting replica {} changes...", replica.site);
+            eprintln!("clock: {:?}", replica.clock);
 
             for replica in replicas.iter_mut() {
                 for operation in &broadcast_queue {
@@ -346,8 +359,12 @@ mod tests {
 
         // Check that each of the n replicas have a consistent view of the list.
         let reference_vals: BTreeMap<_, _> = replicas[0].iter().collect();
+        eprintln!("seed {:?}", baseline_vals);
+        eprintln!("   0 {:?}", reference_vals);
+
         for replica in &replicas[1..] {
             let vals: BTreeMap<_, _> = replica.iter().collect();
+            eprintln!("{:>4} {:?}", replica.site, vals);
             prop_assert_eq!(&vals, &reference_vals);
         }
     }

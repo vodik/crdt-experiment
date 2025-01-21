@@ -37,8 +37,8 @@ impl PartialOrd for Clock {
 
         let all_sites: BTreeSet<_> = self.inner.keys().chain(other.inner.keys()).collect();
         for &site in &all_sites {
-            let self_counter = *self.inner.get(&site).unwrap_or(&0);
-            let other_counter = *other.inner.get(&site).unwrap_or(&0);
+            let self_counter = *self.inner.get(site).unwrap_or(&0);
+            let other_counter = *other.inner.get(site).unwrap_or(&0);
 
             match self_counter.cmp(&other_counter) {
                 Ordering::Less => less = true,
@@ -57,12 +57,6 @@ impl PartialOrd for Clock {
             (false, false) => Some(Ordering::Equal),
             (true, true) => None,
         }
-    }
-}
-
-impl Ord for Clock {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
     }
 }
 
