@@ -1,37 +1,32 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Clock {
-    clock: BTreeMap<u64, u64>,
-    sum: u64,
+    inner: BTreeMap<u64, u64>,
 }
 
 impl Clock {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
-            clock: BTreeMap::new(),
-            sum: 0,
+            inner: BTreeMap::new(),
         }
     }
 
+    #[inline]
     pub fn increment(&mut self, site: u64) {
-        *self.clock.entry(site).or_insert(0) += 1;
-        self.sum += 1;
+        *self.inner.entry(site).or_default() += 1;
     }
 
-    pub fn merge(&mut self, other: &Self) {
-        for (&site, &counter) in &other.clock {
-            let entry = self.clock.entry(site).or_insert(0);
-            if *entry < counter {
-                self.sum += entry.abs_diff(counter);
-                *entry = counter;
-            }
-        }
+    #[inline]
+    pub fn delta_for(&self, site: u64) -> ClockDelta {
+        let counter = self.inner.get(&site).copied().unwrap_or_default();
+        ClockDelta::new(site, counter)
     }
 
+    #[inline]
     pub fn sum(&self) -> u64 {
-        self.sum
+        self.inner.values().sum()
     }
 }
 
@@ -40,21 +35,92 @@ impl PartialOrd for Clock {
         let mut less = false;
         let mut greater = false;
 
-        for (&site, &self_counter) in self.clock.iter().chain(other.clock.iter()) {
-            let other_counter = other.clock.get(&site).cloned().unwrap_or(0);
+        let all_sites: BTreeSet<_> = self.inner.keys().chain(other.inner.keys()).collect();
+        for &site in &all_sites {
+            let self_counter = *self.inner.get(&site).unwrap_or(&0);
+            let other_counter = *other.inner.get(&site).unwrap_or(&0);
 
             match self_counter.cmp(&other_counter) {
                 Ordering::Less => less = true,
                 Ordering::Greater => greater = true,
                 Ordering::Equal => {}
             }
+
+            if less && greater {
+                break;
+            }
         }
 
         match (less, greater) {
-            (true, true) => None,
             (true, false) => Some(Ordering::Less),
             (false, true) => Some(Ordering::Greater),
             (false, false) => Some(Ordering::Equal),
+            (true, true) => None,
         }
+    }
+}
+
+impl Ord for Clock {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClockDelta {
+    site: u64,
+    counter: u64,
+}
+
+impl ClockDelta {
+    #[inline]
+    pub fn new(site: u64, counter: u64) -> Self {
+        Self { site, counter }
+    }
+}
+
+pub trait Merge<T> {
+    fn merge(&mut self, other: &T);
+}
+
+impl Merge<Clock> for Clock {
+    fn merge(&mut self, other: &Clock) {
+        for (&site, &other_counter) in &other.inner {
+            let entry = self.inner.entry(site).or_insert(0);
+            if *entry < other_counter {
+                *entry = other_counter;
+            }
+        }
+    }
+}
+
+impl Merge<ClockDelta> for Clock {
+    #[inline]
+    fn merge(&mut self, delta: &ClockDelta) {
+        let entry = self.inner.entry(delta.site).or_insert(0);
+        if *entry < delta.counter {
+            *entry = delta.counter;
+        }
+    }
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Clock(")?;
+        let mut first = true;
+        for (site, counter) in &self.inner {
+            if !first {
+                write!(f, ", ")?;
+            }
+            first = false;
+            write!(f, "{}:{}", site, counter)?;
+        }
+        write!(f, ")")
+    }
+}
+
+impl std::fmt::Debug for ClockDelta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ClockDelta({}:{})", self.site, self.counter)
     }
 }

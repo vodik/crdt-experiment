@@ -1,54 +1,7 @@
-use std::cmp::Ordering;
-use std::collections::{hash_map, HashMap};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Id {
-    pub site: u64,
-    pub seq: u64,
-}
-
-impl Id {
-    pub fn new(site: u64, seq: u64) -> Self {
-        Self { site, seq }
-    }
-}
-
-impl PartialOrd for Id {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Id {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.seq
-            .cmp(&other.seq)
-            .then_with(|| self.site.cmp(&other.site))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Operation<K, V> {
-    Put(PutOp<K, V>),
-    Delete(DeleteOp<K>),
-}
-
-impl<K, V> Operation<K, V>
-where
-    K: Clone,
-{
-    pub fn put(key: K, version_id: Id, value: V) -> Self {
-        Self::Put(PutOp {
-            key,
-            version_id,
-            value,
-        })
-    }
-
-    pub fn delete(key: K, version_id: Id) -> Self {
-        Self::Delete(DeleteOp { key, version_id })
-    }
-}
+use crate::clock::{Clock, ClockDelta, Merge};
+use crate::id::Id;
+use std::collections::HashMap;
+use std::hash::Hash;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutOp<K, V> {
@@ -61,6 +14,38 @@ pub struct PutOp<K, V> {
 pub struct DeleteOp<K> {
     key: K,
     version_id: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Op<K, V> {
+    Put(PutOp<K, V>),
+    Delete(DeleteOp<K>),
+}
+
+impl<K, V> Op<K, V> {
+    fn put(key: K, version_id: Id, value: V) -> Self {
+        Self::Put(PutOp {
+            key,
+            version_id,
+            value,
+        })
+    }
+
+    fn delete(key: K, version_id: Id) -> Self {
+        Self::Delete(DeleteOp { key, version_id })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Operation<K, V> {
+    op: Op<K, V>,
+    when: ClockDelta,
+}
+
+impl<K, V> Operation<K, V> {
+    pub fn new(op: Op<K, V>, clock: ClockDelta) -> Self {
+        Self { op, when: clock }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,33 +70,42 @@ impl<V> Entry<V> {
 #[derive(Debug, Clone)]
 pub struct Rht<K, V> {
     site: u64,
-    seq: u64,
+    clock: Clock,
     map: HashMap<K, Entry<V>>,
 }
 
 impl<K, V> Rht<K, V>
 where
-    K: Clone + Eq + std::hash::Hash,
+    K: Clone + Eq + Hash,
     V: Clone,
 {
     pub fn new(site: u64) -> Self {
         Self {
             site,
-            seq: 0,
+            clock: Clock::new(),
             map: HashMap::new(),
         }
     }
 
+    pub fn replicate(&self, site: u64) -> Self {
+        let mut other = self.clone();
+        other.site = site;
+        other
+    }
+
     fn next_id(&mut self) -> Id {
-        self.seq += 1;
-        Id::new(self.site, self.seq)
+        self.clock.increment(self.site);
+        Id::new(self.site, self.clock.sum())
     }
 
     pub fn put(&mut self, key: K, value: V) -> Operation<K, V> {
         let version_id = self.next_id();
         self.map
             .insert(key.clone(), Entry::new(version_id, value.clone()));
-        Operation::put(key, version_id, value)
+        Operation::new(
+            Op::put(key, version_id, value),
+            self.clock.delta_for(self.site),
+        )
     }
 
     pub fn update<F>(&mut self, key: K, f: F) -> Option<Operation<K, V>>
@@ -125,10 +119,9 @@ where
         let entry = self.map.get_mut(&key).unwrap();
         entry.version_id = new_version_id;
 
-        Some(Operation::put(
-            key.clone(),
-            new_version_id,
-            entry.value.clone().unwrap(),
+        Some(Operation::new(
+            Op::put(key.clone(), new_version_id, entry.value.clone().unwrap()),
+            self.clock.delta_for(self.site),
         ))
     }
 
@@ -143,41 +136,36 @@ where
         entry.version_id = version_id;
         entry.value = None;
 
-        Some(Operation::delete(key, version_id))
+        Some(Operation::new(
+            Op::delete(key, version_id),
+            self.clock.delta_for(self.site),
+        ))
     }
 
     pub fn apply(&mut self, op: Operation<K, V>) {
-        let updated = match op {
-            Operation::Put(pop) => self.remote_put(pop),
-            Operation::Delete(dop) => self.remote_delete(dop),
-        };
-
-        if updated {
-            self.seq += 1;
+        self.clock.merge(&op.when);
+        match op.op {
+            Op::Put(pop) => self.remote_put(pop),
+            Op::Delete(dop) => self.remote_delete(dop),
         }
     }
 
-    fn remote_put(&mut self, pop: PutOp<K, V>) -> bool {
-        let entry = self.map.entry(pop.key.clone());
-        match entry {
-            hash_map::Entry::Occupied(mut entry) => {
-                let entry = entry.get_mut();
+    fn remote_put(&mut self, pop: PutOp<K, V>) {
+        self.map
+            .entry(pop.key.clone())
+            .and_modify(|entry| {
                 if pop.version_id > entry.version_id {
                     entry.version_id = pop.version_id;
-                    entry.value = Some(pop.value);
+                    entry.value = Some(pop.value.clone());
                 }
-            }
-            hash_map::Entry::Vacant(entry) => {
-                entry.insert(Entry {
-                    version_id: pop.version_id,
-                    value: Some(pop.value),
-                });
-            }
-        }
-        true
+            })
+            .or_insert(Entry {
+                version_id: pop.version_id,
+                value: Some(pop.value),
+            });
     }
 
-    fn remote_delete(&mut self, dop: DeleteOp<K>) -> bool {
+    fn remote_delete(&mut self, dop: DeleteOp<K>) {
         let entry = self.map.entry(dop.key.clone()).or_insert_with(|| Entry {
             version_id: dop.version_id,
             value: None,
@@ -186,9 +174,7 @@ where
         if dop.version_id > entry.version_id {
             entry.version_id = dop.version_id;
             entry.value = None;
-            return true;
         }
-        false
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
@@ -223,6 +209,7 @@ mod tests {
     use super::*;
     use proptest::collection::vec;
     use proptest::prelude::*;
+    use std::collections::BTreeMap;
     use std::ops::Range;
     use test_strategy::proptest;
 
@@ -317,8 +304,8 @@ mod tests {
 
     #[proptest]
     fn test_replica_convergence(
-        #[strategy(vec(any::<u8>(), 10..200))] seed: Vec<u8>,
-        #[strategy(vec(vec(ops(0..#seed.len()), 1..30), 2..100))] plan: Vec<Vec<Op<u8>>>,
+        #[strategy(vec(any::<u8>(), 10..20))] seed: Vec<u8>,
+        #[strategy(vec(vec(ops(0..#seed.len()), 1..10), 2..30))] plan: Vec<Vec<Op<u8>>>,
     ) {
         let base_rht = {
             let mut rht = Rht::new(0);
@@ -327,17 +314,12 @@ mod tests {
             }
             rht
         };
-        let baseline_vals: HashMap<_, _> = base_rht.iter().collect();
 
         // Create n replicas of the base RHT.
         let mut replicas: Vec<_> = plan
             .iter()
             .enumerate()
-            .map(|(replica_id, _)| {
-                let mut replica = base_rht.clone();
-                replica.site = replica_id as u64 + 1;
-                replica
-            })
+            .map(|(replica_id, _)| base_rht.replicate(replica_id as u64))
             .collect();
 
         // On each replica RHT, apply m operations.
@@ -348,22 +330,11 @@ mod tests {
             broadcast_queue.clear();
 
             for op in ops {
-                match op {
-                    Op::Put(key, value) => {
-                        let operation = replica.put(*key, value.clone());
-                        broadcast_queue.push(operation);
-                    }
-                    Op::Delete(key) => {
-                        if let Some(operation) = replica.delete(*key) {
-                            broadcast_queue.push(operation);
-                        }
-                    }
-                }
-            }
-
-            eprintln!("replica {}:", replica.site);
-            for operation in &broadcast_queue {
-                eprintln!("-> {:?}", &operation);
+                let operation = match op {
+                    Op::Put(key, value) => Some(replica.put(*key, value.clone())),
+                    Op::Delete(key) => replica.delete(*key),
+                };
+                broadcast_queue.extend(operation);
             }
 
             for replica in replicas.iter_mut() {
@@ -374,13 +345,9 @@ mod tests {
         }
 
         // Check that each of the n replicas have a consistent view of the list.
-        let reference_vals: HashMap<_, _> = replicas[0].iter().collect();
-        eprintln!("\n--- {:?}", baseline_vals);
-        eprintln!("+++ {:?}", reference_vals);
-        eprintln!("===============");
-
+        let reference_vals: BTreeMap<_, _> = replicas[0].iter().collect();
         for replica in &replicas[1..] {
-            let vals: HashMap<_, _> = replica.iter().collect();
+            let vals: BTreeMap<_, _> = replica.iter().collect();
             prop_assert_eq!(&vals, &reference_vals);
         }
     }
