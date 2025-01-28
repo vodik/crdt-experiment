@@ -483,7 +483,7 @@ mod tests {
             for op in ops {
                 let operation = match op {
                     Op::Insert(index, value) => Some(replica.insert(*index, value.clone())),
-                    Op::Replace(index, value) => replica.update(*index, |v| *v = value.clone()),
+                    Op::Replace(index, value) => replica.update(*index, |v| v.clone_from(value)),
                     Op::Delete(index) => replica.delete(*index),
                 };
 
